@@ -1,0 +1,19 @@
+[project]
+name = "agent-testweaver"
+version = "0.1.0"
+description = "Conversational AI agent for test generation on svc-accounting"
+requires-python = ">=3.10"
+
+dependencies = [
+  "pydantic>=2.0",
+  "httpx>=0.24",
+  "python-dotenv>=1.0",
+  "pyyaml>=6.0",
+  "tiktoken>=0.7",          # if using OpenAI models
+  "openai>=1.0",            # or internal LLM SDK
+  "fastapi>=0.110",         # optional, later
+  "uvicorn>=0.30",          # optional, later
+]
+
+[project.scripts]
+testweaver = "agent-testweaver.main:app"
