@@ -1,0 +1,32 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.env
+venv/
+.venv/
+.mtech/
+.mtech_env/
+.env.*
+
+# FastAPI / runtime files
+*.db
+*.sqlite3
+logs/
+*.log
+
+# Development artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test / coverage / build
+htmlcov/
+.coverage
+dist/
+build/
+*.egg-info/

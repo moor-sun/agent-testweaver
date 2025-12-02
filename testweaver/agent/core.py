@@ -14,8 +14,13 @@ class TestWeaverAgent:
         self.short_term = short_term
         self.git = MCPGitClient(repo)
         self.llm = LLMClient()
-        self.system_prompt = pathlib.Path("prompts/system_agent.md").read_text(encoding="utf-8")
-        self.test_prompt = pathlib.Path("prompts/test_generation.md").read_text(encoding="utf-8")
+        # Base directory where this file is located
+        BASE_DIR = pathlib.Path(__file__).resolve().parent.parent  # one level up to testweaver/
+
+        PROMPTS_DIR = BASE_DIR / "prompts"
+
+        self.system_prompt = (PROMPTS_DIR / "system_agent.md").read_text(encoding="utf-8")
+        self.test_prompt = (PROMPTS_DIR / "test_generation.md").read_text(encoding="utf-8")
 
     def _build_messages(self, user_message: str, task_context: Optional[str] = None):
         history = self.short_term.get_history(self.session_id)
