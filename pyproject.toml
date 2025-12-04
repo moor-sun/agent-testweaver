@@ -1,19 +1,49 @@
 [project]
 name = "testweaver"
 version = "0.1.0"
-description = "Conversational AI agent for test generation on svc-accounting"
+description = "AI Agent for RAG-powered test generation with Qdrant long-term memory"
 requires-python = ">=3.10"
 
 dependencies = [
-  "pydantic>=2.0",
-  "httpx>=0.24",
-  "python-dotenv>=1.0",
-  "pyyaml>=6.0",
-  "tiktoken>=0.7",          # if using OpenAI models
-  "openai>=1.0",            # or internal LLM SDK
-  "fastapi>=0.110",         # optional, later
-  "uvicorn>=0.30",          # optional, later
+    # Core framework
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+
+    # HTTP client for LLM + MCP Git APIs
+    "httpx>=0.24",
+
+    # Environment configuration
+    "python-dotenv>=1.0",
+
+    # PDF processing for RAG
+    "pypdf>=3.0",
+
+    # YAML for Swagger/OpenAPI loader
+    "pyyaml>=6.0",
+
+    # Token counting (optional)
+    "tiktoken>=0.7",
+
+    # OpenAI API client (or local models through OpenAI-compatible servers)
+    "openai>=1.0",
+
+    # Vector DB – Qdrant
+    "qdrant-client>=1.8.0",
+
+    # Embedding model support if needed
+    "sentence-transformers>=2.6.0",
+
+    # Pydantic for data models
+    "pydantic>=2.0",
+
+    # Utilities
+    "typing-extensions>=4.0",
 ]
 
 [project.scripts]
 testweaver = "testweaver.main:app"
+
+[tool.uvicorn]
+reload = true
+host = "0.0.0.0"
+port = 9090

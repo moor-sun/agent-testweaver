@@ -1,152 +1,186 @@
-# TestWeaver – AI Agent for Automated Test Case Generation
+# TestWeaver - AI Agent for Automated Test Case Generation
 
-TestWeaver is an AI-powered agent designed for automated test case generation and Quality Engineering support.
-It works with local LLMs (via Ollama) and can optionally use OpenAI GPT models when cloud access is available.
-
-This project is part of an M.Tech AI/ML dissertation focusing on applying AI to improve test productivity and coverage.
+TestWeaver is an AI-powered agent that generates tests with Retrieval-Augmented Generation (RAG) and Git-backed code access.
 
 ---
 
 ## Features
 
-- Local/offline LLM support through Ollama
-- API-driven usage through FastAPI (Swagger UI included)
-- Structured test case generation using prompt templates
-- Extensible agent design (future: Jira / Sonar / RAG support)
-- Fully configurable via .env
+- FastAPI HTTP API with Swagger UI  
+- LLM client for OpenAI-compatible endpoints (local or cloud)  
+- Prompt-driven chat and test-generation flows  
+- **RAG backed by Qdrant vector DB (Docker or embedded)**  
+- RAG ingestion for PDFs (chunked) and Swagger specs  
+- RAG document listing and deletion endpoints  
+- Session-based short-term memory; Qdrant-backed long-term memory
 
 ---
 
 ## Project Structure
 
-TESTWEAVER/
-    data/                        # Future use: RAG knowledge base
-    testweaver/                  # Main Python package
-        agent/                   # Agent logic and orchestration
-        api/                     # FastAPI routes (HTTP entrypoints)
-        llm/                     # LLM client integration (Ollama / OpenAI)
-        mcp/                     # Future multi-agent control
-        memory/                  # Future session/history support
-        prompts/                 # Prompt templates for behavior and output style
-        rag/                     # Placeholder for doc retrieval logic
-        utils/                   # Utility helpers
-        __init__.py
-        main.py                  # Local entrypoint (if needed)
-        test_openai.py           # Simple validation script for OpenAI config
-    .env                         # Environment settings (ignored in Git)
-    .env.example                 # Template for environment variables
-    .gitignore                   # Ignoring caches, venv, secrets, etc.
-    poetry.lock
-    pyproject.toml               # Python dependency + entrypoint
-    README.md                    # This file
+```
+testweaver/
+  data/
+    qdrant_store/          # (optional) local Qdrant storage if using embedded mode
+  testweaver/
+    agent/                 # Agent orchestration
+    api/                   # FastAPI routes
+    llm/                   # LLM client
+    mcp/                   # MCP Git client
+    memory/                # Short- and long-term memory
+    prompts/               # Prompt templates
+    rag/                   # RAG loaders + index + Qdrant integration
+    utils/                 # Logging/config helpers
+    main.py                # CLI entrypoint target
+  .env                     
+  .env.example             
+  pyproject.toml           
+  README.md
+```
 
 ---
 
 ## Prerequisites
 
-- Python 3.10+ (recommended to use Conda environment)
-- Poetry package manager
-- One of the following LLM setups:
-  - Ollama (recommended) – free and offline
-  - OpenAI API key – requires billing/quota
+- Python 3.10+  
+- Poetry  
+- An OpenAI-compatible LLM endpoint (local Ollama/LM Studio/etc. or cloud)  
+- **Qdrant vector DB**, either via Docker or embedded
 
 ---
 
-## Installation and Setup
+## Setup
 
-1. Clone the repository:
-    git clone <your-repo-url>
-    cd testweaver
+### 1) Clone the repository
 
-2. Activate Python environment:
-    conda activate mtech
-    OR:
-    python -m venv .venv
-    .\.venv\Scriptsctivate
+```
+git clone <your-repo-url>
+cd testweaver
+```
 
-3. Install dependencies:
-    poetry install
+### 2) Install dependencies
 
----
+```
+poetry install
+```
 
-## LLM Configuration
+### 3) Start Qdrant (Recommended: Docker)
 
-### Option A — Use Local LLM via Ollama (Recommended)
+```
+docker run -p 6333:6333 -v qdrant_storage:/qdrant/storage qdrant/qdrant
+```
 
-Install Ollama for Windows:  
-https://ollama.com/download/windows
+- Qdrant API URL: `http://localhost:6333`
+- Data persists inside Docker volume `qdrant_storage`
 
-Pull a model:
-    ollama pull llama3.1
+> TestWeaver uses **Qdrant HTTP mode** by default.
 
-Update .env:
-    LLM_BASE_URL=http://localhost:11434/v1
-    OPENAI_API_KEY=ollama
-    LLM_MODEL_NAME=llama3.1
+### 4) Configure environment variables
 
-### Option B — Use OpenAI GPT Models (requires billing)
+TestWeaver does not auto-load `.env`.  
+Set them in your shell:
 
-Update .env:
-    LLM_BASE_URL=https://api.openai.com/v1
-    OPENAI_API_KEY=sk-<your-key>
-    LLM_MODEL_NAME=gpt-4o-mini
+```
+LLM_BASE_URL=<http://localhost:11434/v1 or https://api.openai.com/v1>
+LLM_API_KEY=<token or blank if local>
+LLM_MODEL_NAME=<model-id>
+GIT_REPO_SVC_ACCOUNTING=<org/repo>
+GIT_TOKEN=<token>
 
----
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=testweaver_memory
 
-## Running the Application
+TESTWEAVER_HOST=0.0.0.0
+TESTWEAVER_PORT=9090
+```
 
-Start FastAPI:
-    poetry run uvicorn testweaver.api.http_api:app --reload
+PowerShell example:
 
-Open Swagger:
-    http://localhost:8000/docs
-
----
-
-## Sample Request (Swagger → POST /chat)
-
-{
-  "session_id": "demo",
-  "message": "Generate test cases for login page",
-  "query_for_rag": ""
-}
+```
+$env:LLM_BASE_URL="http://localhost:11434/v1"
+$env:LLM_MODEL_NAME="llama3.1"
+$env:QDRANT_URL="http://localhost:6333"
+$env:QDRANT_COLLECTION="testweaver_memory"
+```
 
 ---
 
-## Customizing Test Output
+## Running the API
 
-Edit files under testweaver/prompts:
+```
+poetry run uvicorn testweaver.api.http_api:app --host 0.0.0.0 --port 9090
+```
 
-- system_agent.md
-- test_generation.md
-
----
-
-## Git Guidelines
-
-Important ignored folders/files:
-- .env
-- __pycache__/
-- *.pyc
-
-Cleanup accidental tracked caches:
-    git rm -r --cached __pycache__
-    git commit -m "Remove cached files"
+Swagger UI:  
+`http://localhost:9090/docs`
 
 ---
 
-## Future Enhancements
+## RAG & Vector Store (Qdrant)
 
-- Jira enrichment agent
-- SonarQube findings review
-- Memory per session ID
-- Retrieval-Augmented Generation (RAG)
-- Model selection based on context
+### Long-Term Memory
+
+TestWeaver now uses **Qdrant** as its vector store.
+
+Each chunk stored includes:
+
+- Numeric point ID (hash of `doc_id`)  
+- Logical doc ID (`pdf:<file>:chunk:n`)  
+- Payload containing:  
+  - `text`  
+  - `meta` (source filename, type, page, etc.)
+
+### Ingestion
+
+- `POST /ingest/pdf`  
+  Takes a PDF → extracts text → chunks → stores chunks in Qdrant.
+
+- `POST /ingest/swagger`  
+  Stores summarized Swagger text blocks into Qdrant.
+
+### Inspection
+
+- `GET /rag/docs`  
+  Lists documents stored in Qdrant.
+
+- `GET /rag/chunks`  
+  Shows chunk content previews (doc_id, meta, text sample).
+
+### Deletion
+
+- `DELETE /rag/docs/{doc_id}`  
+  Deletes a **single** chunk mapped by `doc_id`.
+
+*(You are **not** using the delete-by-source endpoint in this version.)*
+
+---
+
+## Prompts
+
+- `testweaver/prompts/system_agent.md`  
+- `testweaver/prompts/test_generation.md`  
+
+Customize these to tune agent behavior & output quality.
+
+---
+
+## Notes
+
+- `.env` is not auto-loaded; export environment variables manually or use:  
+  ```
+  python -m dotenv run -- uvicorn testweaver.api.http_api:app --host 0.0.0.0 --port 9090
+  ```
+
+- Works with:
+  - Ollama (OpenAI-compatible server mode)
+  - LM Studio
+  - OpenAI API
+  - Groq API (OpenAI format)
 
 ---
 
 ## Author
 
 M.Tech AI/ML Dissertation Project  
-Author: Sundaramoorthy N  
+**Sundaramoorthy N**  
 BITS Pilani WILP Program

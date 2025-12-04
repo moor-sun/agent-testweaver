@@ -82,25 +82,73 @@ def ingest_swagger(url: str):
     return {"status": "ok", "doc_id": doc_id}
 
 @app.get("/rag/docs")
-def list_rag_docs():
-    docs = []
-    for item in lt_memory.index:
-        text = item.get("text", "")
-        preview = text[:200] + ("..." if len(text) > 200 else "")
-        docs.append(
-            {
-                "doc_id": item.get("doc_id"),
-                "meta": item.get("meta", {}),
-                "preview": preview,
-                "length": len(text),
-            }
-        )
-    return docs
+def list_rag_docs(limit: int = 100):
+    """
+    List documents currently stored in long-term memory (Qdrant).
 
-@app.delete("/ingest/{doc_id}")
-def delete_doc(doc_id: str):
-    deleted = rag_index.delete(doc_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Document not found")
-    return {"status": "deleted", "doc_id": doc_id}
+    `limit` controls how many docs we return from the first scroll page.
+    """
+    try:
+        docs = lt_memory.list_documents(limit=limit)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error listing RAG documents: {e}",
+        )
+
+    # Shape into a clean API response
+    return {
+        "limit": limit,
+        "count": len(docs),
+        "docs": docs,
+    }
+
+from fastapi import HTTPException
+
+@app.get("/rag/chunks")
+def list_chunks(limit: int = 20):
+    """
+    Shows actual stored chunks (doc_id, meta, and text preview).
+    """
+    try:
+        points, _ = lt_memory.client.scroll(
+            collection_name=lt_memory.collection_name,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Error reading chunks: {e}")
+
+    out = []
+    for p in points:
+        payload = p.payload or {}
+        doc_id = payload.get("doc_id", p.id)
+        meta = payload.get("meta", {})
+        text = payload.get("text", "")[:300]  # preview first 300 chars
+
+        out.append({
+            "qdrant_id": p.id,
+            "doc_id": doc_id,
+            "meta": meta,
+            "text_preview": text
+        })
+
+    return {
+        "count": len(out),
+        "chunks": out
+    }
+
+@app.delete("/rag/docs/{doc_id}")
+def delete_rag_doc(doc_id: str):
+    """
+    Delete a single RAG document by its logical doc_id.
+    Example:
+      DELETE /rag/docs/pdf:accounting_domain_business_details.pdf:chunk:0
+    """
+    ok = lt_memory.delete_document(doc_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+
+    return {"deleted": True, "doc_id": doc_id}
 

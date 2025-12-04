@@ -3,65 +3,136 @@ import time
 import httpx
 from dotenv import load_dotenv
 
-# Load .env once at import time
+# Load env file once
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-BASE_URL = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
-MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-4o-mini")
+import os
+import time
+import httpx
+from dotenv import load_dotenv
 
-# Debug logs – remove later if you want
-print("[LLM] BASE_URL:", BASE_URL)
-print("[LLM] MODEL_NAME:", MODEL_NAME)
-print("[LLM] OPENAI_API_KEY present:", bool(OPENAI_API_KEY))
+# Load env file once
+load_dotenv()
 
-if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY is not set. "
-        "Make sure it's in your .env and that load_dotenv() can see it."
-    )
+BASE_URL = os.getenv("LLM_BASE_URL")
+MODEL_NAME = os.getenv("LLM_MODEL_NAME")
+API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
+
+if not BASE_URL:
+    raise RuntimeError("LLM_BASE_URL is missing in .env")
+
+if not MODEL_NAME:
+    raise RuntimeError("LLM_MODEL_NAME is missing in .env")
+
+# Detect local LLM (so API key should be ignored)
+IS_LOCAL = BASE_URL.startswith("http://localhost") or BASE_URL.startswith("http://127.0.0.1")
+
+print("[LLM] BASE_URL =", BASE_URL)
+print("[LLM] MODEL_NAME =", MODEL_NAME)
+print("[LLM] API_KEY present =", bool(API_KEY))
+print("[LLM] IS_LOCAL =", IS_LOCAL)
+
 
 class LLMClient:
     def __init__(self):
+        headers = {"Content-Type": "application/json"}
+
+        # ONLY send key if not local (Ollama ignores Bearer anyway)
+        if not IS_LOCAL:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+
+        # Generous timeout for local CPU models
         self._client = httpx.Client(
             base_url=BASE_URL,
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=120.0,
+            headers=headers,
+            timeout=httpx.Timeout(300.0, connect=30.0, read=300.0),
         )
 
-    def chat(self, messages, max_retries: int = 3):
+    def chat(self, messages, max_retries=3):
         payload = {
             "model": MODEL_NAME,
             "messages": messages,
         }
 
         for attempt in range(1, max_retries + 1):
-            resp = self._client.post("/chat/completions", json=payload)
+            try:
+                resp = self._client.post("/chat/completions", json=payload)
 
-            # Debug: print first bit of response text for errors
+            except httpx.ReadTimeout:
+                print(f"[LLM] ReadTimeout on attempt {attempt}/{max_retries}")
+                if attempt < max_retries:
+                    time.sleep(5 * attempt)
+                    continue
+                raise RuntimeError("LLM timed out. Reduce prompt size or use faster model.")
+
             if resp.status_code != 200:
-                print(
-                    f"[LLM] HTTP {resp.status_code}. Response: "
-                    f"{resp.text[:300]}..."
-                )
+                print(f"[LLM] Error {resp.status_code}: {resp.text[:200]}")
 
+            # Retry 429
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("retry-after", "1"))
-                print(
-                    f"[LLM] 429 Too Many Requests. Attempt {attempt}/{max_retries}. "
-                    f"Sleeping for {retry_after} seconds..."
-                )
-                time.sleep(retry_after)
+                wait = int(resp.headers.get("retry-after", "2"))
+                print(f"[LLM] 429: retry after {wait}s")
+                time.sleep(wait)
                 continue
 
             resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            return resp.json()["choices"][0]["message"]["content"]
 
-        raise RuntimeError(
-            "LLM rate-limited (429) after multiple attempts. "
-            "Check OpenAI usage/limits."
+        raise RuntimeError("Failed after retries")
+
+
+# Detect local LLM (so API key should be ignored)
+IS_LOCAL = BASE_URL.startswith("http://localhost") or BASE_URL.startswith("http://127.0.0.1")
+
+print("[LLM] BASE_URL =", BASE_URL)
+print("[LLM] MODEL_NAME =", MODEL_NAME)
+print("[LLM] API_KEY present =", bool(API_KEY))
+print("[LLM] IS_LOCAL =", IS_LOCAL)
+
+
+class LLMClient:
+    def __init__(self):
+        headers = {"Content-Type": "application/json"}
+
+        # ONLY send key if not local (Ollama ignores Bearer anyway)
+        if not IS_LOCAL:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+
+        # Generous timeout for local CPU models
+        self._client = httpx.Client(
+            base_url=BASE_URL,
+            headers=headers,
+            timeout=httpx.Timeout(300.0, connect=30.0, read=300.0),
         )
+
+    def chat(self, messages, max_retries=3):
+        payload = {
+            "model": MODEL_NAME,
+            "messages": messages,
+        }
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = self._client.post("/chat/completions", json=payload)
+
+            except httpx.ReadTimeout:
+                print(f"[LLM] ReadTimeout on attempt {attempt}/{max_retries}")
+                if attempt < max_retries:
+                    time.sleep(5 * attempt)
+                    continue
+                raise RuntimeError("LLM timed out. Reduce prompt size or use faster model.")
+
+            if resp.status_code != 200:
+                print(f"[LLM] Error {resp.status_code}: {resp.text[:200]}")
+
+            # Retry 429
+            if resp.status_code == 429:
+                wait = int(resp.headers.get("retry-after", "2"))
+                print(f"[LLM] 429: retry after {wait}s")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+        raise RuntimeError("Failed after retries")
