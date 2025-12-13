@@ -8,7 +8,7 @@ from ..memory.long_term import LongTermMemory
 from ..memory.short_term import ShortTermMemory
 from ..rag.index import RAGIndex
 from ..rag.loaders.pdf_loader import load_pdf_as_chunks
-from ..rag.loaders.swagger_loader import fetch_swagger_json, summarise_swagger
+from ..rag.loaders.swagger_loader import fetch_swagger_json, openapi_to_rag_chunks
 from ..agent.core import TestWeaverAgent
 from fastapi import HTTPException
 from testweaver.utils import config as settings
@@ -86,10 +86,26 @@ async def ingest_pdf(session_id: str = Form(...), file: UploadFile = File(...)):
 @app.post("/ingest/swagger")
 def ingest_swagger(url: str):
     openapi = fetch_swagger_json(url)
-    text = summarise_swagger(openapi)
-    doc_id = f"swagger:{url}"
-    rag_index.ingest_text(doc_id, text, meta={"type": "swagger", "url": url})
-    return {"status": "ok", "doc_id": doc_id}
+
+    chunks = openapi_to_rag_chunks(
+        openapi,
+        source_url=url,
+        service_name="svc-accounting"
+    )
+
+    count = 0
+    for ch in chunks:
+        m = ch["meta"]
+        if m["type"] == "operation":
+            doc_id = f"swagger::op::{m['method']}::{m['path']}"
+        else:
+            doc_id = f"swagger::schema::{m['schema_name']}"
+
+        rag_index.ingest_text(doc_id, ch["text"], meta=m)
+        count += 1
+
+    return {"ok": True, "chunks_ingested": count}
+
 
 @app.get("/rag/docs")
 def list_rag_docs(limit: int = 100):
@@ -161,4 +177,31 @@ def delete_rag_doc(doc_id: str):
         raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
 
     return {"deleted": True, "doc_id": doc_id}
+
+
+@app.delete("/rag/docs")
+def delete_rag_docs(doc_id: str | None = None):
+    """
+    Delete documents from RAG storage.
+
+    - If `doc_id` is provided as a query parameter, delete that single document.
+    - If `doc_id` is omitted or empty, delete ALL RAG content.
+
+    Examples:
+      DELETE /rag/docs?doc_id=pdf:foo.pdf:chunk:0
+      DELETE /rag/docs  # deletes everything
+    """
+    try:
+        ok = lt_memory.delete_document(doc_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting RAG documents: {e}")
+
+    # When deleting a specific doc, preserve old behavior and return 404 if not found
+    if doc_id:
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Document not found: {doc_id}")
+        return {"deleted": True, "doc_id": doc_id}
+
+    # Deleting all
+    return {"deleted_all": True, "ok": bool(ok)}
 

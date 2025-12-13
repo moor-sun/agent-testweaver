@@ -2,6 +2,8 @@
 from typing import List, Tuple, Dict, Any, Optional
 import pathlib
 import hashlib
+import json
+from collections.abc import Mapping, Iterable
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
@@ -35,6 +37,17 @@ class LongTermMemory:
         self._embedder = SentenceTransformer(embedding_model_name)
         self.vector_dim = self._embedder.get_sentence_embedding_dimension()
 
+        # Validate embedding dimension once at startup
+        test_vec = self._embedder.encode("dim check")
+        dim = len(test_vec)
+        print("Embedder model:", embedding_model_name, "dim:", dim)
+
+        if dim != 384:
+            raise RuntimeError(
+                f"Embedder dim is {dim}, but Qdrant collection expects 384. "
+                f"Use all-MiniLM-L6-v2 (384) or recreate the collection to match."
+            )
+        
         # Qdrant client: embedded (file-based) or remote HTTP
         if local_qdrant_path:
             # Example: local_qdrant_path="./data/qdrant"
@@ -72,13 +85,38 @@ class LongTermMemory:
                 ),
             )
 
-    def _embed(self, text: str):
-        """
-        Compute embedding for a single text.
-        """
+    def _embed(self, text) -> list[float]:
+        # ---- Normalize input to a single string ----
+        if isinstance(text, Mapping):
+            # swagger/openapi dict etc.
+            text = json.dumps(text, ensure_ascii=False)
+        elif isinstance(text, (list, tuple)):
+            # list of strings -> join
+            text = "\n".join(map(str, text))
+        elif not isinstance(text, str):
+            # any other type -> stringify
+            text = str(text)
+
         vec = self._embedder.encode(text)
-        # sentence-transformers returns numpy array; convert to list
-        return vec.tolist()
+
+        # sentence-transformers returns numpy array for single string,
+        # and numpy 2D array for list input. Convert to python.
+        if hasattr(vec, "tolist"):
+            vec = vec.tolist()
+
+        # If we still somehow got 2D embeddings, fail loudly with a clear message
+        if vec and isinstance(vec[0], list):
+            raise ValueError(
+                f"_embed received iterable input and produced 2D embeddings: "
+                f"shape=({len(vec)}, {len(vec[0])}). Ensure you pass a single string to ingest_text()."
+            )
+
+        if len(vec) != self.vector_dim:
+            raise ValueError(f"EMBED DIM mismatch: got {len(vec)} expected {self.vector_dim}")
+
+        return vec
+
+
 
     def _make_point_id(self, doc_id: str) -> int:
         """
@@ -91,6 +129,7 @@ class LongTermMemory:
     # ------------------------------------------------------------------
     # Public API – same method signatures as your original class
     # ------------------------------------------------------------------
+
     def add_document(self, doc_id: str, text: str, meta: dict) -> None:
         """
         Add or update a document in Qdrant.
@@ -102,13 +141,42 @@ class LongTermMemory:
             meta = {}
 
         vector = self._embed(text)
+
+        # ---- Ensure vector is plain Python list[float] ----
+        # (some embedders return numpy arrays)
+        if hasattr(vector, "tolist"):
+            vector = vector.tolist()
+
+        if not isinstance(vector, list) or not vector:
+            raise ValueError(f"Embedder returned invalid vector for doc_id={doc_id}: {type(vector)}")
+
+        # ---- Check expected dimension from Qdrant collection ----
+        try:
+            vcfg = self.client.get_collection(self.collection_name).config.params.vectors
+            expected_dim = getattr(vcfg, "size", None)  # works for single-vector collections
+        except Exception as e:
+            raise RuntimeError(f"Failed to read Qdrant collection config for {self.collection_name}: {e}")
+
+        if expected_dim is None:
+            raise RuntimeError(
+                f"Could not detect vector size for collection {self.collection_name}. "
+                f"Vectors config was: {vcfg}"
+            )
+
+        if len(vector) != expected_dim:
+            raise ValueError(
+                f"Embedding dim mismatch for doc_id={doc_id}: got {len(vector)} expected {expected_dim}. "
+                f"Fix by using the same embedding model everywhere OR recreate the Qdrant collection "
+                f"with the correct size."
+            )
+
         point_id = self._make_point_id(doc_id)
 
         point = qmodels.PointStruct(
-            id=point_id,                  # <-- numeric ID
-            vector=vector,
+            id=point_id,
+            vector=vector,  # single vector (matches your config: size=384)
             payload={
-                "doc_id": doc_id,         # <-- original string ID
+                "doc_id": doc_id,
                 "text": text,
                 "meta": meta,
             },
@@ -118,6 +186,7 @@ class LongTermMemory:
             collection_name=self.collection_name,
             points=[point],
         )
+
     def search(self, query: str, top_k: int = 5) -> List[Tuple[str, str, dict]]:
         """
         Semantic search using vector similarity.
@@ -175,23 +244,58 @@ class LongTermMemory:
         return results
 
 
-    def delete_document(self, doc_id: str) -> bool:
+    def delete_document(self, doc_id: Optional[str] = None) -> bool:
         """
-        Remove a doc by logical doc_id (string).
-        We hash it to the same numeric point_id used in add_document.
+        Delete documents from the Qdrant collection.
+
+        If `doc_id` is provided (string), delete that single document.
+        If `doc_id` is None or empty, delete ALL RAG content in the collection by
+        scrolling through stored points and deleting them in batches.
+
+        Returns True if the delete request was issued successfully, False on error.
         """
         from qdrant_client.http import models as qmodels
 
-        point_id = self._make_point_id(doc_id)
-
         try:
-            self.client.delete(
-                collection_name=self.collection_name,
-                points_selector=qmodels.PointIdsList(points=[point_id]),
-            )
+            if doc_id:
+                # Single-document delete (stable numeric point id)
+                point_id = self._make_point_id(doc_id)
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=qmodels.PointIdsList(points=[point_id]),
+                )
+                return True
+
+            # Bulk delete: no doc_id provided -> delete everything in the collection
+            # We'll use `scroll` to enumerate point ids and delete in batches.
+            batch_size = 500
+            points_to_delete = []
+
+            offset = 0
+            while True:
+                pts, _ = self.client.scroll(
+                    collection_name=self.collection_name,
+                    limit=batch_size,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                if not pts:
+                    break
+                ids = [getattr(p, "id", None) for p in pts]
+                ids = [i for i in ids if i is not None]
+                if ids:
+                    # delete this batch
+                    self.client.delete(
+                        collection_name=self.collection_name,
+                        points_selector=qmodels.PointIdsList(points=ids),
+                    )
+                # If fewer than batch_size returned, we're done
+                if len(pts) < batch_size:
+                    break
+
             return True
+
         except Exception:
-            # Optionally log the exception with your logger
             return False
 
 
