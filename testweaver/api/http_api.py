@@ -1,4 +1,6 @@
 # api/http_api.py
+from fastapi.middleware.cors import CORSMiddleware
+
 import os
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
@@ -17,6 +19,14 @@ app = FastAPI(
     title="TestWeaver Agent API",
     description="Agent for code-aware test case generation with RAG + MCP Git",
     version="0.1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev mode – wide open; you can tighten later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 lt_memory = LongTermMemory()
