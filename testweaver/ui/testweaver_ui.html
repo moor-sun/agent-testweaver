@@ -1364,6 +1364,54 @@
         setStatus("Idle");
       }
     });
+
+    // Server-Sent Events helper for test generation streaming
+    function startTestGenerationStream(servicePath) {
+      const baseUrl = getBaseUrl();
+      const url = `${baseUrl}/generate-tests/stream?service_path=${encodeURIComponent(servicePath)}`;
+      const evt = new EventSource(url);
+
+      evt.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          console.log('SSE:', data);
+          // update UI state using stage / partial fields if present
+          if (data.stage === 'progress' && data.partial) {
+            // append or display partial output somewhere — hook into your UI state
+            // example: append to a pre element with id 'streamOutput'
+            const out = document.getElementById('streamOutput');
+            if (out) out.textContent += data.partial;
+          }
+
+          if (data.stage === 'done') {
+            // final message, close the stream
+            evt.close();
+          }
+        } catch (err) {
+          console.error('Failed to parse SSE data', err, e.data);
+        }
+      };
+
+      evt.onerror = (err) => {
+        console.error('SSE error', err);
+        // optionally close on errors or update status
+      };
+
+      return evt;
+    }
+
+    // Optional: wire to a button with id generateTestsBtn and an input with id servicePathInput
+    const genBtn = document.getElementById('generateTestsBtn');
+    const svcInput = document.getElementById('servicePathInput');
+    if (genBtn && svcInput) {
+      genBtn.addEventListener('click', () => {
+        const svc = svcInput.value.trim();
+        if (!svc) return alert('Enter service path');
+        // clear output area
+        const out = document.getElementById('streamOutput'); if (out) out.textContent = '';
+        startTestGenerationStream(svc);
+      });
+    }
   </script>
 </body>
 </html>

@@ -51,11 +51,30 @@ def chat(req: ChatRequest):
     answer = agent.chat(req.message, query_for_rag=req.query_for_rag)
     return {"reply": answer}
 
+from fastapi import HTTPException
+
 @app.post("/generate-tests")
 def generate_tests(req: GenerateTestsRequest):
-    agent = TestWeaverAgent(req.session_id, rag_index, st_memory, SVC_REPO)
-    code = agent.generate_tests_for_file(req.service_path, extra_instructions=req.extra_instructions or "")
-    return {"test_code": code}
+    try:
+        agent = TestWeaverAgent(req.session_id, rag_index, st_memory, SVC_REPO)
+
+        result = agent.generate_tests_for_file(
+            req.service_path,
+            extra_instructions=req.extra_instructions or "",
+            compile_after=True,
+            max_attempts=3
+        )
+
+        # Ensure test_code is always a string (prevents [object Object])
+        tc = result.get("test_code", "")
+        if not isinstance(tc, str):
+            result["test_code"] = str(tc)
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
 
 @app.post("/ingest/pdf")
 async def ingest_pdf(session_id: str = Form(...), file: UploadFile = File(...)):
@@ -205,3 +224,39 @@ def delete_rag_docs(doc_id: str | None = None):
     # Deleting all
     return {"deleted_all": True, "ok": bool(ok)}
 
+@app.get("/generate-tests/stream")
+def generate_tests_stream(service_path: str, extra_instructions: str = "", repo: str = "svc-accounting"):
+    """
+    Server-Sent Events stream. UI can listen and update status live.
+    """
+
+    async def event_generator():
+        # Create agent (adapt constructor args to your setup)
+        agent = TestWeaverAgent(
+            session_id="ui-session",
+            rag_index=rag_index,
+            short_term=st_memory,
+            repo=repo
+        )
+
+        # We replicate the bounded loop but emit events for UI
+        max_attempts = 3
+
+        # initial event
+        yield f"data: {json.dumps({'stage':'start','message':'Starting test generation','max_attempts':max_attempts})}\n\n"
+        await asyncio.sleep(0)
+
+        # Call core method but “manual stream” progress:
+        # easiest: run the new core method and just stream attempt_log at end (low effort)
+        # better: copy the attempt loop here and emit after each stage.
+        result = agent.generate_tests_for_file(
+            service_path=service_path,
+            extra_instructions=extra_instructions,
+            compile_after=True,
+            max_attempts=max_attempts
+        )
+
+        # final event
+        yield f"data: {json.dumps({'stage':'done','result':result})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
