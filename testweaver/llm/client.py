@@ -48,11 +48,19 @@ class LLMClient:
             timeout=httpx.Timeout(300.0, connect=30.0, read=300.0),
         )
 
-    def chat(self, messages, max_retries=3):
+    def chat(self, messages, max_retries=3, temperature: float | None = None, **kwargs):
+        """Send chat messages to the LLM.
+
+        Supports optional temperature and additional kwargs forwarded to the model API.
+        """
         payload = {
             "model": MODEL_NAME,
             "messages": messages,
         }
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        # pass-through for other model params like max_tokens, n, top_p etc.
+        payload.update(kwargs)
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -88,51 +96,3 @@ print("[LLM] BASE_URL =", BASE_URL)
 print("[LLM] MODEL_NAME =", MODEL_NAME)
 print("[LLM] API_KEY present =", bool(API_KEY))
 print("[LLM] IS_LOCAL =", IS_LOCAL)
-
-
-class LLMClient:
-    def __init__(self):
-        headers = {"Content-Type": "application/json"}
-
-        # ONLY send key if not local (Ollama ignores Bearer anyway)
-        if not IS_LOCAL:
-            headers["Authorization"] = f"Bearer {API_KEY}"
-
-        # Generous timeout for local CPU models
-        self._client = httpx.Client(
-            base_url=BASE_URL,
-            headers=headers,
-            timeout=httpx.Timeout(300.0, connect=30.0, read=300.0),
-        )
-
-    def chat(self, messages, max_retries=3):
-        payload = {
-            "model": MODEL_NAME,
-            "messages": messages,
-        }
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                resp = self._client.post("/chat/completions", json=payload)
-
-            except httpx.ReadTimeout:
-                print(f"[LLM] ReadTimeout on attempt {attempt}/{max_retries}")
-                if attempt < max_retries:
-                    time.sleep(5 * attempt)
-                    continue
-                raise RuntimeError("LLM timed out. Reduce prompt size or use faster model.")
-
-            if resp.status_code != 200:
-                print(f"[LLM] Error {resp.status_code}: {resp.text[:200]}")
-
-            # Retry 429
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("retry-after", "2"))
-                print(f"[LLM] 429: retry after {wait}s")
-                time.sleep(wait)
-                continue
-
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
-
-        raise RuntimeError("Failed after retries")
