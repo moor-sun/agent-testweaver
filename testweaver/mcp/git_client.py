@@ -105,7 +105,7 @@ class MCPGitClient:
         tool: BuildTool = "maven",
         goal: BuildGoal = "test-compile",
         project_path: str = ".",
-        timeout_seconds: int = 300,
+        timeout_seconds: int = 600,
         extra_args: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         payload = {

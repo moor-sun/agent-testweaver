@@ -45,7 +45,7 @@ class LLMClient:
         self._client = httpx.Client(
             base_url=BASE_URL,
             headers=headers,
-            timeout=httpx.Timeout(300.0, connect=30.0, read=300.0),
+            timeout=httpx.Timeout(600.0, connect=30.0, read=600.0),
         )
 
     def chat(self, messages, max_retries=3, temperature: float | None = None, **kwargs):

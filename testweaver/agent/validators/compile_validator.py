@@ -19,7 +19,7 @@ class CompileValidator:
             tool="maven",
             goal="test-compile",
             project_path=".",
-            timeout_seconds=300,
+            timeout_seconds=600,
             extra_args=["-DskipTests=true"]
         )
         return result

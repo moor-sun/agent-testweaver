@@ -108,9 +108,15 @@ class TestWeaverAgent:
         java_source = self.git.get_file(service_path)
         class_name = service_path.split("/")[-1].replace(".java", "")
 
+        # LIMIT JAVA SOURCE SIZE (prevents Ollama timeouts)
+        java_source = (java_source or "")[:12000]
+
         # RAG only on attempt 1 (keeps retries fast)
         rag_query = f"{class_name} {extra_instructions}".strip()
         rag_context = self.rag_index.retrieve_context(rag_query, top_k=5)
+
+        # LIMIT RAG CONTEXT SIZE (prevents Ollama timeouts)
+        rag_context = (rag_context or "")[:3000]
 
         user_msg = f"""
 Generate JUnit 5 tests for this Java Spring Boot service.
@@ -167,7 +173,7 @@ Rules:
                 messages = list(base_messages)
             else:
                 # IMPORTANT: send actionable compiler diagnostics (not stack trace tail)
-                compiler_basis = self._compile_diag(last_compile or {}, n=260)
+                compiler_basis = self._compile_diag(last_compile or {}, n=80)
 
                 messages = [
                     {"role": "system", "content": self.system_prompt},
@@ -190,6 +196,7 @@ Rules:
             prev_test_before_llm = last_test_code or ""
 
             response = self.llm.chat(messages, temperature=self.llm_temperature)
+
             candidate = self._extract_java_class(self._strip_code_fences(response))
 
             if not self._is_valid_java_test_file(candidate, class_name):
@@ -207,7 +214,7 @@ Rules:
                 prev_tests = self._count_tests(prev_test_before_llm)
                 cand_tests = self._count_tests(candidate)
 
-                err_excerpt = self._compile_diag(last_compile or {}, n=260)
+                err_excerpt = self._compile_diag(last_compile or {}, n=80)
 
                 # DEBUG
                 print("\n" + "=" * 80)
@@ -256,7 +263,7 @@ Rules:
                             "Return ONLY full Java code.\n"
                             "No markdown, no explanations.\n"
                             "MUST start with 'package '.\n"
-                            "Do NOT output XML, pom.xml, dependencies, or explanations."
+                            "Do NOT output shell commands, Maven commands, XML, pom.xml, dependencies, or explanations."
                         )},
                         {"role": "user", "content": "BASE TEST FILE:\n" + prev_test_before_llm},
                         {"role": "user", "content": "COMPILER ERROR (actionable excerpt):\n" + (err_excerpt or "<EMPTY>")},
@@ -303,7 +310,7 @@ Rules:
                 tool="maven",
                 goal="test-compile",
                 project_path=".",
-                timeout_seconds=300,
+                timeout_seconds=600,
                 extra_args=["-DskipTests=true"],
             )
 
@@ -336,7 +343,7 @@ Rules:
             # ---------------------------
             # Deterministic auto-fix (before next LLM attempt)
             # ---------------------------
-            comp_text = self._compile_diag(last_compile, n=260)
+            comp_text = self._compile_diag(last_compile, n=80)
             fixed = self._auto_fix_common_java_test_compile_errors(last_test_code, comp_text)
 
             if self._normalize_for_compare(fixed) != self._normalize_for_compare(last_test_code):
@@ -347,7 +354,7 @@ Rules:
                     tool="maven",
                     goal="test-compile",
                     project_path=".",
-                    timeout_seconds=300,
+                    timeout_seconds=600,
                     extra_args=["-DskipTests=true"],
                 )
 
@@ -498,9 +505,22 @@ Rules:
                 updated = self._ensure_import(updated, "import static org.junit.jupiter.api.Assertions.fail;")
 
         # Assertions missing
-        if "cannot find symbol" in compile_text and "Assertions" in compile_text:
-            if "import static org.junit.jupiter.api.Assertions.*;" not in updated:
-                updated = self._ensure_import(updated, "import static org.junit.jupiter.api.Assertions.*;")
+        # Add JUnit Assertions static import when assert*/fail methods are unresolved
+        if "cannot find symbol" in compile_text and ("symbol:" in compile_text or "method " in compile_text):
+            # Maven typically prints: "symbol:   method assertEquals(...)" or "symbol: method fail(...)"
+            if (
+                "method assert" in compile_text
+                or "method fail" in compile_text
+                or "assertEquals(" in updated
+                or "assertNotNull(" in updated
+                or "assertNull(" in updated
+                or "assertTrue(" in updated
+                or "assertFalse(" in updated
+                or "assertThrows(" in updated
+                or "fail(" in updated
+            ):
+                if "import static org.junit.jupiter.api.Assertions.*;" not in updated:
+                    updated = self._ensure_import(updated, "import static org.junit.jupiter.api.Assertions.*;")
 
         # SpringBootTest import
         if "@SpringBootTest" in updated and "SpringBootTest" in compile_text and "cannot find symbol" in compile_text:
@@ -515,6 +535,11 @@ Rules:
         # JUnit @Test import
         if "@Test" in updated and "Test" in compile_text and "cannot find symbol" in compile_text:
             updated = self._ensure_import(updated, "import org.junit.jupiter.api.Test;")
+
+        # BigDecimal missing import
+        if "cannot find symbol" in compile_text and "BigDecimal" in compile_text:
+            if ("BigDecimal" in updated) and ("import java.math.BigDecimal;" not in updated):
+                updated = self._ensure_import(updated, "import java.math.BigDecimal;")
 
         return updated
 
@@ -551,18 +576,25 @@ Rules:
         s = (code or "").strip()
         if not s:
             return False
-        # Must look like Java source, not XML/markdown
-        if s.lstrip().startswith("<"):
+
+        # Reject obvious non-Java outputs
+        bad_starts = ("<", "mvn ", "gradle ", "./", "sh", "#!/bin", "```", "pom.xml")
+        if s.lower().startswith(bad_starts):
             return False
         if "<dependencies>" in s or "<project" in s:
             return False
-        # Must have package or imports or class
+
+        # Must look like a Java source file
+        if not s.startswith("package "):   # strong requirement for your repo layout
+            return False
         if "class " not in s:
             return False
-        # Must end with a closing brace (very common sanity check)
         if not s.rstrip().endswith("}"):
             return False
-        # Must contain expected test class name
+
+        # Must contain the expected test class
         if f"class {class_name}Test" not in s and f"{class_name}Test" not in s:
             return False
+
         return True
+
