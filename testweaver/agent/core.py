@@ -108,6 +108,7 @@ class TestWeaverAgent:
         self.rag_index = rag_index
         self.short_term = short_term
         self.git = MCPGitClient(repo)
+        self.repo_root = repo
         self.llm = LLMClient()
 
         self.llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
@@ -602,73 +603,98 @@ class TestWeaverAgent:
             else ("❌ FAILED" if final_stage == "fail" else f"⚠️ {esc(final_stage)}")
         )
 
+        jacoco_cov = self._read_jacoco_coverage()
+
+        # Coverage display (avoid "None%")
+        cov_line = "N/A"
+        cov_branch = "N/A"
+        cov_note = "Coverage values come from parsed jacoco.xml (if available)."
+        cov_path = ""
+
+        # Expect these variables to exist:
+        # jacoco_cov = {"ok": bool, "path": str, "line_pct": float|None, "branch_pct": float|None, "reason": str?}
+        try:
+            if isinstance(jacoco_cov, dict):
+                cov_path = jacoco_cov.get("path") or ""
+                if jacoco_cov.get("ok") and jacoco_cov.get("line_pct") is not None:
+                    cov_line = f"{jacoco_cov.get('line_pct')}"
+                if jacoco_cov.get("ok") and jacoco_cov.get("branch_pct") is not None:
+                    cov_branch = f"{jacoco_cov.get('branch_pct')}"
+                if not jacoco_cov.get("ok"):
+                    reason = jacoco_cov.get("reason") or "jacoco.xml unavailable"
+                    cov_note = f"Coverage unavailable: {reason}"
+        except Exception:
+            pass
+
         html_text = f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>TestWeaver Evaluation Report - {esc(request_id)}</title>
-  <style>
-    body {{ font-family: Arial, sans-serif; margin: 24px; }}
-    .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }}
-    th {{ background: #f4f4f4; }}
-    .small {{ color: #555; font-size: 13px; }}
-    code {{ background: #f7f7f7; padding: 2px 6px; border-radius: 6px; }}
-  </style>
-</head>
-<body>
+        <html>
+        <head>
+        <meta charset="utf-8"/>
+        <title>TestWeaver Evaluation Report - {esc(request_id)}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 24px; }}
+            .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }}
+            th {{ background: #f4f4f4; }}
+            .small {{ color: #555; font-size: 13px; }}
+            code {{ background: #f7f7f7; padding: 2px 6px; border-radius: 6px; }}
+        </style>
+        </head>
+        <body>
 
-<h1>TestWeaver Evaluation Report</h1>
+        <h1>TestWeaver Evaluation Report</h1>
 
-<div class="card">
-  <p><b>Run ID (request_id):</b> <code>{esc(request_id)}</code></p>
-  <p><b>Session:</b> <code>{esc(session_id)}</code></p>
-  <p><b>Service Path:</b> <code>{esc(service_path)}</code></p>
-  <p><b>Test Path:</b> <code>{esc(test_path)}</code></p>
-  <p><b>Outcome:</b> {outcome_badge}</p>
-  <p><b>Compilation OK:</b> {esc(compile_ok)}</p>
-  <p><b>Attempts Used:</b> {esc(attempts_used)}</p>
-  <p><b>Total Time (seconds):</b> {esc(total_seconds)}</p>
-  <p><b>Coverage (JaCoCo):</b> LINE={esc(line_pct)}% | BRANCH={esc(branch_pct)}%</p>
-  <p class="small">Coverage values come from parsed jacoco.xml (if available).</p>
-</div>
+        <div class="card">
+        <p><b>Run ID (request_id):</b> <code>{esc(request_id)}</code></p>
+        <p><b>Session:</b> <code>{esc(session_id)}</code></p>
+        <p><b>Service Path:</b> <code>{esc(service_path)}</code></p>
+        <p><b>Test Path:</b> <code>{esc(test_path)}</code></p>
+        <p><b>Outcome:</b> {outcome_badge}</p>
+        <p><b>Compilation OK:</b> {esc(compile_ok)}</p>
+        <p><b>Attempts Used:</b> {esc(attempts_used)}</p>
+        <p><b>Total Time (seconds):</b> {esc(total_seconds)}</p>
 
-{agg_html}
+        <p><b>Coverage (JaCoCo):</b> LINE={esc(cov_line)} | BRANCH={esc(cov_branch)}</p>
+        <p class="small">{esc(cov_note)}</p>
+        {f'<p class="small">jacoco.xml: <code>{esc(cov_path)}</code></p>' if cov_path else ''}
+        </div>
 
-<div class="card">
-  <h2>Stage Metrics (per attempt)</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Stage</th>
-        <th>Timestamp (UTC)</th>
-        <th>Attempt</th>
-        <th>Compile OK</th>
-        <th>Returncode</th>
-        <th>Tests</th>
-        <th>Assertions</th>
-        <th>Assertions/Test</th>
-        <th>Leakage</th>
-        <th>RAG Hit</th>
-        <th>RAG chars</th>
-        <th>Diff (+/-/~)</th>
-      </tr>
-    </thead>
-    <tbody>
-      {''.join(rows)}
-    </tbody>
-  </table>
-</div>
+        {agg_html}
 
-<div class="card">
-  <h2>Compilation Diagnostics (Normalized Signatures)</h2>
-  {''.join(sig_sections) if sig_sections else '<p><i>No compile signature sections found.</i></p>'}
-</div>
+        <div class="card">
+        <h2>Stage Metrics (per attempt)</h2>
+        <table>
+            <thead>
+            <tr>
+                <th>Stage</th>
+                <th>Timestamp (UTC)</th>
+                <th>Attempt</th>
+                <th>Compile OK</th>
+                <th>Returncode</th>
+                <th>Tests</th>
+                <th>Assertions</th>
+                <th>Assertions/Test</th>
+                <th>Leakage</th>
+                <th>RAG Hit</th>
+                <th>RAG chars</th>
+                <th>Diff (+/-/~)</th>
+            </tr>
+            </thead>
+            <tbody>
+            {''.join(rows)}
+            </tbody>
+        </table>
+        </div>
 
-</body>
-</html>
-"""
+        <div class="card">
+        <h2>Compilation Diagnostics (Normalized Signatures)</h2>
+        {''.join(sig_sections) if sig_sections else '<p><i>No compile signature sections found.</i></p>'}
+        </div>
+
+        </body>
+        </html>
+        """
 
         out_dir = pathlib.Path(self._reports_dir())
         out_path = out_dir / f"report_{request_id}.html"
@@ -975,6 +1001,7 @@ Rules (MUST FOLLOW):
                 self._compiled_cache[service_path] = test_code
 
                 coverage = self.generate_coverage_report()
+                jacoco_cov = self._read_jacoco_coverage()
                 jacoco = self._parse_jacoco_xml("target/site/jacoco/jacoco.xml")
 
                 total_seconds = round(time.time() - t0, 3)
@@ -1015,6 +1042,7 @@ Rules (MUST FOLLOW):
                         "parsed": jacoco,
                         "raw": coverage,
                     },
+                    "jacoco_coverage": jacoco_cov,
                     "evaluation_report": {"ok": bool(report_path), "html": report_path},
                 }
 
@@ -1064,6 +1092,7 @@ Rules (MUST FOLLOW):
                 if ok2:
                     self._compiled_cache[service_path] = fixed
                     coverage = self.generate_coverage_report()
+                    jacoco_cov = self._read_jacoco_coverage()
                     jacoco = self._parse_jacoco_xml("target/site/jacoco/jacoco.xml")
                     total_seconds = round(time.time() - t0, 3)
 
@@ -1103,6 +1132,7 @@ Rules (MUST FOLLOW):
                             "parsed": jacoco,
                             "raw": coverage,
                         },
+                        "jacoco_coverage": jacoco_cov,
                         "evaluation_report": {"ok": bool(report_path), "html": report_path},
                     }
 
@@ -1473,3 +1503,53 @@ Rules (MUST FOLLOW):
             extra_args=extra,
         )
         return res
+
+    def _jacoco_xml_path(self) -> str:
+        # Prefer explicit local path (JaCoCo output exists here)
+        svc_root = (os.getenv("GIT_LOCAL_REPO") or "").strip()
+        if svc_root:
+            return str(pathlib.Path(svc_root) / "target" / "site" / "jacoco" / "jacoco.xml")
+
+        # Fallback: try repo_root if it is a real filesystem path
+        return str(pathlib.Path(self.repo_root) / "target" / "site" / "jacoco" / "jacoco.xml")
+
+
+    def _read_jacoco_coverage(self) -> Dict[str, Any]:
+        """
+        Returns {"line_pct": float|None, "branch_pct": float|None, "path": str, "ok": bool}
+        Parses <counter type="LINE|BRANCH" missed="" covered=""/> from jacoco.xml
+        """
+        p = pathlib.Path(self._jacoco_xml_path())
+        if not p.exists():
+            return {"ok": False, "path": str(p), "line_pct": None, "branch_pct": None, "reason": "jacoco.xml not found"}
+
+        try:
+            tree = ET.parse(str(p))
+            root = tree.getroot()
+
+            def pct(counter_type: str) -> Optional[float]:
+                # Prefer top-level counters if present
+                for c in root.findall("counter"):
+                    if (c.get("type") or "").upper() == counter_type:
+                        missed = int(c.get("missed") or "0")
+                        covered = int(c.get("covered") or "0")
+                        total = missed + covered
+                        return round((covered * 100.0 / total), 2) if total else 0.0
+
+                # Fallback: sum all counters of the same type (rare but safe)
+                missed_sum = covered_sum = 0
+                for c in root.iter("counter"):
+                    if (c.get("type") or "").upper() == counter_type:
+                        missed_sum += int(c.get("missed") or "0")
+                        covered_sum += int(c.get("covered") or "0")
+                total = missed_sum + covered_sum
+                return round((covered_sum * 100.0 / total), 2) if total else None
+
+            return {
+                "ok": True,
+                "path": str(p),
+                "line_pct": pct("LINE"),
+                "branch_pct": pct("BRANCH"),
+            }
+        except Exception as e:
+            return {"ok": False, "path": str(p), "line_pct": None, "branch_pct": None, "reason": str(e)[:300]}
