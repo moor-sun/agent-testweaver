@@ -40,6 +40,11 @@ ERROR_PATTERNS = [
     r"\[ERROR\].*cannot be resolved",
     r"\[ERROR\].*class file for .* not found",
     r"constructor .* cannot be applied to given types",
+    r"The blank final field .* may not have been initialized",
+    r"The final field .* cannot be assigned",
+    r"cannot be resolved",
+    r"may not have been initialized",
+    r"cannot be assigned",
 ]
 
 
@@ -116,6 +121,7 @@ class TestWeaverAgent:
 
         # --- Metrics config (dynamic, no hard-coded physical path) ---
         self.metrics_enabled = (os.getenv("METRICS_ENABLED", "true").strip().lower() == "true")
+        self.auto_pr_on_success = (os.getenv("AUTO_PR_ON_SUCCESS", "false").strip().lower() == "true")
 
         BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
 
@@ -343,7 +349,6 @@ class TestWeaverAgent:
             p = pathlib.Path(path)
             if not p.exists():
                 return []
-            # Read last N lines efficiently-ish
             lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
             if len(lines) > limit:
                 lines = lines[-limit:]
@@ -439,12 +444,14 @@ class TestWeaverAgent:
             if not vals:
                 return {}
             vals_sorted = sorted(vals)
+
             def pctl(p: float) -> float:
                 if not vals_sorted:
                     return 0.0
-                k = int(round((p/100.0) * (len(vals_sorted)-1)))
-                k = max(0, min(len(vals_sorted)-1, k))
+                k = int(round((p / 100.0) * (len(vals_sorted) - 1)))
+                k = max(0, min(len(vals_sorted) - 1, k))
                 return vals_sorted[k]
+
             return {
                 "count": len(vals_sorted),
                 "avg": round(sum(vals_sorted) / len(vals_sorted), 3),
@@ -540,10 +547,6 @@ class TestWeaverAgent:
         except Exception:
             attempts_used = None
 
-        # Coverage (if logged on success/fail)
-        line_pct = metrics_final.get("line_pct")
-        branch_pct = metrics_final.get("branch_pct")
-
         # Aggregate metrics
         agg = self._aggregate_metrics_last_n_runs(self.metrics_agg_window) if self.metrics_enabled else {}
         agg_html = "<p><i>Aggregate metrics unavailable (metrics disabled or no history).</i></p>"
@@ -611,7 +614,7 @@ class TestWeaverAgent:
         cov_note = "Coverage values come from parsed jacoco.xml (if available)."
         cov_path = ""
 
-        # Expect these variables to exist:
+        # Expect:
         # jacoco_cov = {"ok": bool, "path": str, "line_pct": float|None, "branch_pct": float|None, "reason": str?}
         try:
             if isinstance(jacoco_cov, dict):
@@ -735,8 +738,13 @@ class TestWeaverAgent:
         t0 = time.time()
         run_events: List[Dict[str, Any]] = []
 
+        service_path = self._norm_repo_path(service_path)
+
         java_source = self.git.get_file(service_path) or ""
-        class_name = service_path.split("/")[-1].replace(".java", "")
+
+        # Robust filename extraction even if service_path had "\" earlier
+        class_name = pathlib.PurePosixPath(service_path).stem
+
 
         # LIMIT JAVA SOURCE SIZE (prevents Ollama timeouts)
         java_source = java_source[:12000]
@@ -879,7 +887,9 @@ Rules (MUST FOLLOW):
                 candidate2 = self._extract_java_class(self._strip_code_fences(r))
                 candidate = candidate2 if self._is_only_test_class(candidate2, class_name) else (prev_test_before_llm or last_test_code)
 
-            candidate = self._auto_fix_common_java_test_compile_errors(candidate, compile_text="")
+            # Use last compile diag as hint if available; otherwise pass ""
+            hint = self._compile_diag(last_compile or {}, n=200) if last_compile else ""
+            candidate = self._auto_fix_common_java_test_compile_errors(candidate, compile_text=hint)
             test_code = candidate
             last_test_code = test_code
 
@@ -1027,6 +1037,8 @@ Rules (MUST FOLLOW):
                 run_events.append(evt.__dict__)
 
                 report_path = self._write_html_report_for_run(request_id, run_events)
+                pr = self._maybe_open_pr(request_id, service_path, test_path, test_code)
+                pr_or_branch = self._maybe_push_branch_on_success(request_id, service_path, test_path)
 
                 return {
                     "status": "SUCCESS",
@@ -1035,6 +1047,8 @@ Rules (MUST FOLLOW):
                     "test_code": test_code,
                     "attempt_log": attempt_log,
                     "compile": last_compile,
+                    "pull_request": pr,
+                    "pull_request": pr_or_branch,
                     "coverage": {
                         "ok": bool(coverage.get("ok")) if isinstance(coverage, dict) else False,
                         "report_html": "target/site/jacoco/index.html",
@@ -1117,6 +1131,8 @@ Rules (MUST FOLLOW):
                     run_events.append(evt.__dict__)
 
                     report_path = self._write_html_report_for_run(request_id, run_events)
+                    pr = self._maybe_open_pr(request_id, service_path, test_path, fixed)
+                    pr_or_branch = self._maybe_push_branch_on_success(request_id, service_path, test_path)
 
                     return {
                         "status": "SUCCESS",
@@ -1125,6 +1141,8 @@ Rules (MUST FOLLOW):
                         "test_code": fixed,
                         "attempt_log": attempt_log,
                         "compile": last_compile,
+                        "pull_request": pr,
+                        "pull_request": pr_or_branch,
                         "coverage": {
                             "ok": bool(coverage.get("ok")) if isinstance(coverage, dict) else False,
                             "report_html": "target/site/jacoco/index.html",
@@ -1262,13 +1280,83 @@ Rules (MUST FOLLOW):
     # Helper utilities
     # ------------------------------------------------------------------
 
+    def _norm_repo_path(self, p: str) -> str:
+        """
+        Normalize Windows/Unix path into repo-relative POSIX style.
+        """
+        p = (p or "").strip().replace("\\", "/")
+        # remove drive letter if accidentally passed (e.g. D:/...)
+        p = re.sub(r"^[A-Za-z]:/", "", p)
+        return p.lstrip("/")
+
+    def _maybe_push_branch_on_success(self, request_id: str, service_path: str, test_path: str) -> Dict[str, Any]:
+        if (os.getenv("AUTO_PR_ON_SUCCESS", "false").strip().lower() != "true"):
+            return {"ok": False, "skipped": True, "reason": "AUTO_PR_ON_SUCCESS=false"}
+
+        base = (os.getenv("AUTO_PR_BASE_BRANCH") or "main").strip()
+        prefix = (os.getenv("AUTO_PR_BRANCH_PREFIX") or "testweaver/").strip()
+        remote = (os.getenv("GIT_REMOTE") or "origin").strip()
+
+        class_name = service_path.split("/")[-1].replace(".java", "")
+        branch = f"{prefix}{class_name}-tests-{request_id[:8]}"
+        msg = f"Add {class_name} tests (TestWeaver {request_id[:8]})"
+
+        if not hasattr(self.git, "push_branch_with_commit"):
+            return {"ok": False, "skipped": True, "reason": "MCPGitClient.push_branch_with_commit not available"}
+
+        return self.git.push_branch_with_commit(
+            branch=branch,
+            base_branch=base,
+            commit_message=msg,
+            files=["src/test/java"],
+            remote=remote,
+        )
+
+    def _maybe_open_pr(self, request_id: str, service_path: str, test_path: str, test_code: str) -> Dict[str, Any]:
+        if not getattr(self, "auto_pr_on_success", False):
+            return {"ok": False, "skipped": True, "reason": "AUTO_PR_ON_SUCCESS=false"}
+
+        base = (os.getenv("AUTO_PR_BASE_BRANCH") or "main").strip()
+        prefix = (os.getenv("AUTO_PR_BRANCH_PREFIX") or "testweaver/").strip()
+        labels = [x.strip() for x in (os.getenv("AUTO_PR_LABELS") or "").split(",") if x.strip()]
+
+        class_name = service_path.split("/")[-1].replace(".java", "")
+        branch = f"{prefix}{class_name}-tests-{request_id[:8]}"
+
+        title = f"TestWeaver: {class_name} tests (compile OK)"
+        body = "\n".join([
+            f"- request_id: `{request_id}`",
+            f"- service: `{service_path}`",
+            f"- test: `{test_path}`",
+            f"- status: compile OK",
+        ])
+
+        # open PR via Git MCP
+        if not hasattr(self.git, "open_pr_on_success"):
+            return {"ok": False, "skipped": True, "reason": "MCPGitClient.open_pr_on_success not available"}
+
+        return self.git.open_pr_on_success(
+            branch=branch,
+            base_branch=base,
+            title=title,
+            body=body,
+            files=["src/test/java"],  # only commit the generated test file
+            commit_message=f"Add {class_name} JUnit tests ({request_id[:8]})",
+            labels=labels,
+        )
+
     def _extract_package(self, java_source: str) -> str:
         m = re.search(r"^\s*package\s+([\w\.]+)\s*;", java_source or "", re.MULTILINE)
         return m.group(1) if m else ""
 
     def _guess_test_path(self, package_name: str, class_name: str) -> str:
-        pkg = package_name.replace(".", "/") if package_name else ""
-        return f"src/test/java/{pkg}/{class_name}Test.java" if pkg else f"src/test/java/{class_name}Test.java"
+        class_name = (class_name or "").strip()
+        class_name = re.sub(r"[^A-Za-z0-9_]", "", class_name)  # safety
+
+        pkg = (package_name or "").strip().replace(".", "/")
+        if pkg:
+            return f"src/test/java/{pkg}/{class_name}Test.java"
+        return f"src/test/java/{class_name}Test.java"
 
     def _strip_code_fences(self, text: str) -> str:
         s = (text or "").strip()
@@ -1335,63 +1423,275 @@ Rules (MUST FOLLOW):
         return True
 
     # ------------------------------------------------------------------
-    # Deterministic fixes
+    # Deterministic fixes (PATCHED)
     # ------------------------------------------------------------------
 
     def _auto_fix_common_java_test_compile_errors(self, test_code: str, compile_text: str) -> str:
+        """
+        Generic, repo-agnostic deterministic fixes for common Java *test* compilation issues.
+
+        FIXED HERE:
+        - If MockitoExtension is missing, we DO NOT re-inject it later (prevents endless loop)
+        - De-duplicates stacked @Mock annotations robustly
+        - Removes accidental Spring @Service leakage on test classes
+        """
         if not test_code:
             return test_code
 
         compile_text = (compile_text or "")
+        lc = compile_text.lower()
         updated = test_code
 
-        # Ensure JUnit 5 imports
+        # Detect missing MockitoExtension in classpath (JUnit5 Mockito extension not available)
+        mockito_ext_missing = (
+            "mockitoextension cannot be resolved" in lc
+            or "class<mockitoextension>" in lc
+            or ("org.mockito.junit.jupiter.mockitoextension" in lc and ("does not exist" in lc or "cannot access" in lc))
+        )
+
+        # Remove common Spring stereotype leakage from tests (harmless + avoids confusion)
+        updated = re.sub(r"(?m)^\s*@Service\s*\r?\n", "", updated)
+        updated = re.sub(r"(?m)^\s*import\s+org\.springframework\.stereotype\.Service\s*;\s*\r?\n", "", updated)
+
+        # --- Strong dedupe: collapse any consecutive @Mock annotations into a single @Mock ---
+        updated = re.sub(r"(?m)(^\s*@Mock\s*\r?\n){2,}", "@Mock\n", updated)
+        updated = re.sub(
+            r"(?m)(^\s*@Mock\s*\r?\n)+(?=\s*(?:private|protected|public)\s+)",
+            "@Mock\n",
+            updated,
+        )
+
+        # --- Fallback if MockitoExtension is missing in classpath ---
+        if mockito_ext_missing:
+            # Remove @ExtendWith(MockitoExtension.class)
+            updated = re.sub(r"(?m)^\s*@ExtendWith\s*\(\s*MockitoExtension\.class\s*\)\s*\r?\n", "", updated)
+
+            # Remove related imports
+            updated = re.sub(r"(?m)^\s*import\s+org\.junit\.jupiter\.api\.extension\.ExtendWith\s*;\s*\r?\n", "", updated)
+            updated = re.sub(r"(?m)^\s*import\s+org\.mockito\.junit\.jupiter\.MockitoExtension\s*;\s*\r?\n", "", updated)
+
+            # Ensure MockitoAnnotations import
+            updated = self._ensure_import(updated, "import org.mockito.MockitoAnnotations;")
+            updated = self._ensure_import(updated, "import org.junit.jupiter.api.BeforeEach;")
+
+            # Add AutoCloseable field to close mocks (optional but clean)
+            if not re.search(r"\bAutoCloseable\s+mocks\b", updated):
+                updated = self._ensure_import(updated, "import java.lang.AutoCloseable;")
+                updated = re.sub(
+                    r"(?m)^\s*public\s+class\s+\w+Test\s*\{\s*",
+                    lambda m: m.group(0) + "\n    private AutoCloseable mocks;\n",
+                    updated,
+                    count=1
+                )
+
+            # Ensure @BeforeEach exists and calls openMocks
+            if "@BeforeEach" in updated:
+                if "MockitoAnnotations.openMocks(this)" not in updated:
+                    updated = re.sub(
+                        r"(?s)(@BeforeEach\s*\r?\n\s*(?:public|protected|private)?\s*void\s+\w+\s*\(\s*\)\s*\{\s*)",
+                        r"\1\n        mocks = MockitoAnnotations.openMocks(this);\n",
+                        updated,
+                        count=1
+                    )
+            else:
+                updated = re.sub(
+                    r"(?m)^\s*public\s+class\s+\w+Test\s*\{\s*",
+                    lambda m: m.group(0) + "\n    @BeforeEach\n    void setUp() {\n        mocks = MockitoAnnotations.openMocks(this);\n    }\n",
+                    updated,
+                    count=1
+                )
+
+            # Add @AfterEach to close mocks (optional, but avoids warnings/leaks)
+            updated = self._ensure_import(updated, "import org.junit.jupiter.api.AfterEach;")
+            if "@AfterEach" not in updated:
+                updated = re.sub(
+                    r"(?m)^\s*public\s+class\s+\w+Test\s*\{\s*",
+                    lambda m: m.group(0) + "\n    @AfterEach\n    void tearDown() throws Exception {\n        if (mocks != null) mocks.close();\n    }\n",
+                    updated,
+                    count=1
+                )
+
+        # ----------------------------------------------------------------------------------
+        # 0) Always-on "safe" structural fixes for test scaffolding (generic across repos)
+        # ----------------------------------------------------------------------------------
+
+        # 0.1 Remove 'final' from field declarations inside tests
+        updated = re.sub(r"(?m)^(\s*(?:private|protected|public)\s+)final(\s+)", r"\1", updated)
+
+        # 0.2 If "<something>Service." is referenced but the field doesn't exist, inject a field.
+        refs = set(re.findall(r"\b([a-z_]\w*)\s*\.", updated))
+        sut_var = ""
+        for r in refs:
+            if r.lower().endswith("service"):
+                sut_var = r
+                break
+
+        m = re.search(r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{", updated)
+        sut_type = m.group(1) if m else ""
+
+        if sut_var and sut_type and not re.search(rf"\b{re.escape(sut_type)}\s+{re.escape(sut_var)}\b", updated):
+            updated = self._ensure_import(updated, "import org.mockito.InjectMocks;")
+
+            # Prefer MockitoExtension when available; otherwise do NOT inject it.
+            if not mockito_ext_missing:
+                updated = self._ensure_import(updated, "import org.junit.jupiter.api.extension.ExtendWith;")
+                updated = self._ensure_import(updated, "import org.mockito.junit.jupiter.MockitoExtension;")
+
+                if "@ExtendWith(MockitoExtension.class)" not in updated:
+                    updated = re.sub(
+                        r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{",
+                        r"@ExtendWith(MockitoExtension.class)\npublic class \1Test {",
+                        updated,
+                        count=1,
+                    )
+
+                if "@InjectMocks" not in updated:
+                    updated = re.sub(
+                        r"(?m)^\s*@ExtendWith\(MockitoExtension\.class\)\s*\r?\n\s*public\s+class\s+\w+Test\s*\{\s*",
+                        lambda mm: mm.group(0) + f"\n    @InjectMocks\n    private {sut_type} {sut_var};\n",
+                        updated,
+                        count=1,
+                    )
+            else:
+                # No MockitoExtension: inject SUT field directly inside class
+                if "@InjectMocks" not in updated:
+                    updated = re.sub(
+                        r"(?m)^\s*public\s+class\s+\w+Test\s*\{\s*",
+                        lambda mm: mm.group(0) + f"\n    @InjectMocks\n    private {sut_type} {sut_var};\n",
+                        updated,
+                        count=1,
+                    )
+
+        # 0.3 If repo/dao fields exist, annotate them with @Mock (generic naming heuristics)
+        updated = self._ensure_import(updated, "import org.mockito.Mock;")
+
+        def _mock_field_repl(match: re.Match) -> str:
+            vis = match.group(1)
+            ftype = match.group(2)
+            name = match.group(3)
+            return f"    @Mock\n    {vis} {ftype} {name};"
+
+        updated = re.sub(
+            r"(?m)^(?!\s*@Mock\s*$)\s*(private|protected|public)\s+([A-Za-z_]\w*(?:Repository|Repo|Dao))\s+([A-Za-z_]\w*)\s*;\s*$",
+            _mock_field_repl,
+            updated,
+        )
+
+        # ----------------------------------------------------------------------------------
+        # 1) Ensure JUnit 5 imports (compile-safe)
+        # ----------------------------------------------------------------------------------
         if "@Test" in updated and "import org.junit.jupiter.api.Test;" not in updated:
             updated = self._ensure_import(updated, "import org.junit.jupiter.api.Test;")
         if "@BeforeEach" in updated and "import org.junit.jupiter.api.BeforeEach;" not in updated:
             updated = self._ensure_import(updated, "import org.junit.jupiter.api.BeforeEach;")
+        if "@AfterEach" in updated and "import org.junit.jupiter.api.AfterEach;" not in updated:
+            updated = self._ensure_import(updated, "import org.junit.jupiter.api.AfterEach;")
+
         if "Assertions." in updated or re.search(r"\bassert[A-Z]\w*\s*\(", updated):
             if "import static org.junit.jupiter.api.Assertions.*;" not in updated:
                 updated = self._ensure_import(updated, "import static org.junit.jupiter.api.Assertions.*;")
 
-        # Optional/BigDecimal
+        # ----------------------------------------------------------------------------------
+        # 2) Common Java stdlib imports
+        # ----------------------------------------------------------------------------------
         if ("Optional." in updated or "Optional<" in updated) and "import java.util.Optional;" not in updated:
             updated = self._ensure_import(updated, "import java.util.Optional;")
         if ("BigDecimal." in updated or "new BigDecimal" in updated) and "import java.math.BigDecimal;" not in updated:
             updated = self._ensure_import(updated, "import java.math.BigDecimal;")
+        if ("List<" in updated or "ArrayList" in updated) and "import java.util.List;" not in updated:
+            updated = self._ensure_import(updated, "import java.util.List;")
 
-        # ResponseEntity mismatch
-        if ("incompatible types" in compile_text and "ResponseEntity" in compile_text) or (
-            "ResponseEntity<" in updated and "ResponseEntity" in compile_text
-        ):
+        # ----------------------------------------------------------------------------------
+        # 3) Mockito static imports if Mockito usage is present
+        # ----------------------------------------------------------------------------------
+        if re.search(r"\bwhen\s*\(", updated) or re.search(r"\bverify\s*\(", updated) or "Mockito." in updated:
+            updated = self._ensure_import(updated, "import static org.mockito.Mockito.*;")
+
+        # ----------------------------------------------------------------------------------
+        # 4) Compile-text-driven fixes
+        # ----------------------------------------------------------------------------------
+        lc = (compile_text or "").lower()
+
+        # 4.1 ResponseEntity mismatch
+        if ("incompatible types" in lc and "responseentity" in lc) or ("ResponseEntity<" in updated and "responseentity" in lc):
             updated = re.sub(
                 r"ResponseEntity\s*<\s*([A-Za-z_]\w*)\s*>\s+(\w+)\s*=",
                 r"\1 \2 =",
-                updated
+                updated,
             )
             updated = updated.replace(".getBody()", "")
             updated = re.sub(r"(?m)^\s*import\s+org\.springframework\.http\.ResponseEntity;\s*\r?\n", "", updated)
 
-        # TransactionType missing
+        # 4.2 TransactionType missing
         if ("TransactionType" in updated) and (
-            ("symbol:   class TransactionType" in compile_text) or
-            ("cannot find symbol" in compile_text and "TransactionType" in compile_text)
+            ("symbol:   class transactiontype" in lc)
+            or ("cannot find symbol" in lc and "transactiontype" in lc)
+            or ("transactiontype cannot be resolved" in lc)
         ):
             updated = re.sub(r"\bTransactionType\s*\.\s*[A-Z_]+\b", "null", updated)
             updated = re.sub(r"(?m)^\s*import\s+.*TransactionType\s*;\s*\r?\n", "", updated)
 
-        # remove assertions calling missing getters
-        if "method getReference()" in compile_text or ("cannot find symbol" in compile_text and "getReference" in compile_text):
+        # 4.3 Remove assertions calling missing getters
+        if "getreference" in lc and ("cannot find symbol" in lc or "method getreference" in lc):
             updated = re.sub(r"(?m)^\s*assertEquals\([^;]*getReference\(\)[^;]*\);\s*\r?\n?", "", updated)
-        if "method getStatus()" in compile_text or ("cannot find symbol" in compile_text and "getStatus" in compile_text):
+        if "getstatus" in lc and ("cannot find symbol" in lc or "method getstatus" in lc):
             updated = re.sub(r"(?m)^\s*assertEquals\([^;]*getStatus\(\)[^;]*\);\s*\r?\n?", "", updated)
-        if "method getMessage()" in compile_text or ("cannot find symbol" in compile_text and "getMessage" in compile_text):
+        if "getmessage" in lc and ("cannot find symbol" in lc or "method getmessage" in lc):
             updated = re.sub(r"(?m)^\s*assertEquals\([^;]*getMessage\(\)[^;]*\);\s*\r?\n?", "", updated)
 
-        # rewrite all-args constructor to no-args if compiler says so
+        # 4.4 Rewrite all-args constructor to no-args if compiler says so
         ctor_noarg_classes = self._classes_with_noarg_required(compile_text)
         for cls in ctor_noarg_classes:
             updated = self._rewrite_all_args_to_noarg(updated, cls)
+
+        # ----------------------------------------------------------------------------------
+        # 5) Additional generic fixes for "cannot be resolved" WITHOUT re-injecting MockitoExtension when missing
+        # ----------------------------------------------------------------------------------
+        if "cannot be resolved" in lc:
+            refs2 = set(re.findall(r"\b([a-z_]\w*)\s*\.", updated))
+            sut_var2 = ""
+            for r in refs2:
+                if r.lower().endswith("service"):
+                    sut_var2 = r
+                    break
+            m2 = re.search(r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{", updated)
+            sut_type2 = m2.group(1) if m2 else ""
+            if sut_var2 and sut_type2 and not re.search(rf"\b{re.escape(sut_type2)}\s+{re.escape(sut_var2)}\b", updated):
+                updated = self._ensure_import(updated, "import org.mockito.InjectMocks;")
+
+                if not mockito_ext_missing:
+                    updated = self._ensure_import(updated, "import org.junit.jupiter.api.extension.ExtendWith;")
+                    updated = self._ensure_import(updated, "import org.mockito.junit.jupiter.MockitoExtension;")
+                    if "@ExtendWith(MockitoExtension.class)" not in updated:
+                        updated = re.sub(
+                            r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{",
+                            r"@ExtendWith(MockitoExtension.class)\npublic class \1Test {",
+                            updated,
+                            count=1,
+                        )
+                    if "@InjectMocks" not in updated:
+                        updated = re.sub(
+                            r"(?m)^\s*@ExtendWith\(MockitoExtension\.class\)\s*\r?\n\s*public\s+class\s+\w+Test\s*\{\s*",
+                            lambda mm: mm.group(0) + f"\n    @InjectMocks\n    private {sut_type2} {sut_var2};\n",
+                            updated,
+                            count=1,
+                        )
+                else:
+                    if "@InjectMocks" not in updated:
+                        updated = re.sub(
+                            r"(?m)^\s*public\s+class\s+\w+Test\s*\{\s*",
+                            lambda mm: mm.group(0) + f"\n    @InjectMocks\n    private {sut_type2} {sut_var2};\n",
+                            updated,
+                            count=1,
+                        )
+
+        # Final safety pass: collapse @Mock duplicates again
+        updated = re.sub(r"(?m)(^\s*@Mock\s*\r?\n){2,}", "@Mock\n", updated)
+        updated = re.sub(
+            r"(?m)(^\s*@Mock\s*\r?\n)+(?=\s*(?:private|protected|public)\s+)",
+            "@Mock\n",
+            updated,
+        )
 
         return updated
 
@@ -1513,7 +1813,6 @@ Rules (MUST FOLLOW):
         # Fallback: try repo_root if it is a real filesystem path
         return str(pathlib.Path(self.repo_root) / "target" / "site" / "jacoco" / "jacoco.xml")
 
-
     def _read_jacoco_coverage(self) -> Dict[str, Any]:
         """
         Returns {"line_pct": float|None, "branch_pct": float|None, "path": str, "ok": bool}
@@ -1553,3 +1852,53 @@ Rules (MUST FOLLOW):
             }
         except Exception as e:
             return {"ok": False, "path": str(p), "line_pct": None, "branch_pct": None, "reason": str(e)[:300]}
+
+    # ------------------------------------------------------------------
+    # Legacy helper (kept as-is; not used in main flow)
+    # ------------------------------------------------------------------
+
+    def _normalize_mockito_scaffold(self, test_code: str) -> str:
+        if not test_code:
+            return test_code
+        s = test_code
+
+        # 1) Remove 'final' from field declarations (safe + generic for tests)
+        s = re.sub(r"(?m)^(\s*(?:private|protected|public)\s+)final(\s+)", r"\1", s)
+
+        # 2) Detect class under test from filename convention: FooServiceTest -> FooService
+        m = re.search(r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{", s)
+        sut_type = m.group(1) if m else ""
+
+        # 3) If code references "<name>Service." but field not declared, inject field
+        refs = set(re.findall(r"\b([a-z_]\w*)\s*\.", s))
+        sut_var = ""
+        for r in refs:
+            if r.lower().endswith("service"):
+                sut_var = r
+                break
+
+        if sut_var and not re.search(rf"\b{re.escape(sut_type)}\s+{re.escape(sut_var)}\b", s):
+            # Ensure imports for Mockito extension + InjectMocks
+            s = self._ensure_import(s, "import org.junit.jupiter.api.extension.ExtendWith;")
+            s = self._ensure_import(s, "import org.mockito.InjectMocks;")
+            s = self._ensure_import(s, "import org.mockito.junit.jupiter.MockitoExtension;")
+
+            # Add @ExtendWith if missing
+            if "@ExtendWith(MockitoExtension.class)" not in s:
+                s = re.sub(
+                    r"(?m)^\s*public\s+class\s+([A-Za-z_]\w*)Test\s*\{",
+                    r"@ExtendWith(MockitoExtension.class)\npublic class \1Test {",
+                    s,
+                    count=1
+                )
+
+            # Add field near start of class body
+            if sut_type:
+                s = re.sub(
+                    r"(?m)^\s*@ExtendWith\(MockitoExtension\.class\)\s*\r?\n\s*public\s+class\s+\w+Test\s*\{\s*",
+                    lambda mm: mm.group(0) + f"\n    @InjectMocks\n    private {sut_type} {sut_var};\n",
+                    s,
+                    count=1
+                )
+
+        return s
