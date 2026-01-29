@@ -227,22 +227,6 @@ class TestWeaverAgent:
 
         return False
 
-    def _diff_stats(self, before: str, after: str) -> Dict[str, int]:
-        before_lines = (before or "").splitlines()
-        after_lines = (after or "").splitlines()
-        sm = difflib.SequenceMatcher(a=before_lines, b=after_lines)
-        added = removed = changed = 0
-        for op, i1, i2, j1, j2 in sm.get_opcodes():
-            if op == "insert":
-                added += (j2 - j1)
-            elif op == "delete":
-                removed += (i2 - i1)
-            elif op == "replace":
-                removed += (i2 - i1)
-                added += (j2 - j1)
-                changed += max(i2 - i1, j2 - j1)
-        return {"lines_added": added, "lines_removed": removed, "lines_changed": changed}
-
     # ------------------------------------------------------------------
     # Compiler diagnostics normalization
     # ------------------------------------------------------------------
@@ -489,7 +473,6 @@ class TestWeaverAgent:
         test_count = self._count_tests(test_code)
         assertion_count = self._count_assertions(test_code)
         leakage = self._detect_leakage(test_code)
-        diff = self._diff_stats(prev_test_code or "", test_code or "")
         compile_diag = self._compile_diag(compile_dict or {}, n=260) if isinstance(compile_dict, dict) else ""
 
         rag_hit = bool((rag_context or "").strip())
@@ -502,8 +485,8 @@ class TestWeaverAgent:
             "leakage": bool(leakage),
             "rag_hit": rag_hit,
             "rag_context_chars": rag_chars,
-            **diff,
         }
+
 
         if compile_diag:
             payload["error_signatures"] = self._error_signatures(compile_diag)
@@ -529,7 +512,6 @@ class TestWeaverAgent:
         service_path = first.get("service_path", "")
         test_path = first.get("test_path", "")
 
-        # Final event
         final = None
         for e in reversed(run_events):
             if e.get("stage") in ("success", "fail", "tool_failure"):
@@ -541,41 +523,37 @@ class TestWeaverAgent:
         metrics_final = (final or {}).get("metrics") or {}
 
         total_seconds = metrics_final.get("total_seconds")
-        attempts_used = None
         try:
-            attempts_used = max(_safe_int(e.get("attempt")) or 0 for e in run_events)
+            attempts_used = max(int(e.get("attempt") or 0) for e in run_events)
         except Exception:
             attempts_used = None
 
+        # Outcome badge
+        if final_stage == "success":
+            outcome_badge = '<span class="badge good">✅ SUCCESS</span>'
+        elif final_stage == "fail":
+            outcome_badge = '<span class="badge bad">❌ FAILED</span>'
+        else:
+            outcome_badge = f'<span class="badge warn">⚠️ {esc(final_stage)}</span>'
+
+        jacoco_cov = self._read_jacoco_coverage()
+        cov_line = esc(jacoco_cov.get("line_pct")) if jacoco_cov.get("ok") else "N/A"
+        cov_branch = esc(jacoco_cov.get("branch_pct")) if jacoco_cov.get("ok") else "N/A"
+        cov_path = esc(jacoco_cov.get("path")) if jacoco_cov else ""
+        cov_note = jacoco_cov.get("reason", "Parsed from jacoco.xml") if isinstance(jacoco_cov, dict) else ""
+
         # Aggregate metrics
         agg = self._aggregate_metrics_last_n_runs(self.metrics_agg_window) if self.metrics_enabled else {}
-        agg_html = "<p><i>Aggregate metrics unavailable (metrics disabled or no history).</i></p>"
-        if agg:
-            def fmt_stat(s: Dict[str, Any]) -> str:
-                if not s:
-                    return "N/A"
-                return f"avg={s.get('avg')} | median={s.get('median')} | min={s.get('min')} | p90={s.get('p90')} | max={s.get('max')} (n={s.get('count')})"
 
-            agg_html = f"""
-            <div class="card">
-              <h2>Aggregate Metrics (last {esc(agg.get("window_runs"))} runs)</h2>
-              <p><b>Compilation Success Rate (CSR):</b> {esc(agg.get("csr_pct"))}%</p>
-              <p><b>Attempts-to-success:</b> {esc(fmt_stat(agg.get("attempts") or {}))}</p>
-              <p><b>Time-to-success (seconds):</b> {esc(fmt_stat(agg.get("time_seconds") or {}))}</p>
-              <p><b>Line Coverage %:</b> {esc(fmt_stat(agg.get("line_coverage_pct") or {}))}</p>
-              <p><b>Branch Coverage %:</b> {esc(fmt_stat(agg.get("branch_coverage_pct") or {}))}</p>
-              <p class="small">These aggregates are computed from your JSONL metrics file grouped by request_id.</p>
-            </div>
-            """
-
-        # Stage metrics rows
+        # Table rows
         rows = []
         for e in run_events:
             m = e.get("metrics") or {}
+            stage = (e.get("stage") or "").strip()
             rows.append(
                 "<tr>"
-                f"<td>{esc(e.get('stage'))}</td>"
-                f"<td>{esc(e.get('ts_utc'))}</td>"
+                f"<td><span class='stage {esc(stage)}'>{esc(stage)}</span></td>"
+                f"<td class='muted'>{esc(e.get('ts_utc'))}</td>"
                 f"<td>{esc(e.get('attempt'))}</td>"
                 f"<td>{esc(e.get('compile_ok'))}</td>"
                 f"<td>{esc(e.get('returncode'))}</td>"
@@ -585,7 +563,6 @@ class TestWeaverAgent:
                 f"<td>{esc(m.get('leakage'))}</td>"
                 f"<td>{esc(m.get('rag_hit'))}</td>"
                 f"<td>{esc(m.get('rag_context_chars'))}</td>"
-                f"<td>+{esc(m.get('lines_added'))} / -{esc(m.get('lines_removed'))} / ~{esc(m.get('lines_changed'))}</td>"
                 "</tr>"
             )
 
@@ -593,119 +570,128 @@ class TestWeaverAgent:
         sig_sections = []
         for e in run_events:
             if e.get("stage") in ("compile", "compile_after_autofix"):
-                m = e.get("metrics") or {}
-                sigs = m.get("error_signatures") or []
-                sig_html = "<ul>" + "".join(f"<li>{esc(s)}</li>" for s in sigs) + "</ul>" if sigs else "<p><i>No error signatures (clean compile).</i></p>"
+                sigs = (e.get("metrics") or {}).get("error_signatures") or []
+                sig_html = (
+                    "<ul>" + "".join(f"<li>{esc(s)}</li>" for s in sigs) + "</ul>"
+                    if sigs else "<p class='small'><i>No error signatures.</i></p>"
+                )
                 sig_sections.append(
-                    f"<h3>{esc(e.get('stage'))} (compile_ok={esc(e.get('compile_ok'))}, returncode={esc(e.get('returncode'))})</h3>"
-                    f"{sig_html}"
+                    f"<h3>{esc(e.get('stage'))} (compile_ok={esc(e.get('compile_ok'))})</h3>{sig_html}"
                 )
 
-        outcome_badge = (
-            "✅ SUCCESS" if final_stage == "success"
-            else ("❌ FAILED" if final_stage == "fail" else f"⚠️ {esc(final_stage)}")
-        )
-
-        jacoco_cov = self._read_jacoco_coverage()
-
-        # Coverage display (avoid "None%")
-        cov_line = "N/A"
-        cov_branch = "N/A"
-        cov_note = "Coverage values come from parsed jacoco.xml (if available)."
-        cov_path = ""
-
-        # Expect:
-        # jacoco_cov = {"ok": bool, "path": str, "line_pct": float|None, "branch_pct": float|None, "reason": str?}
-        try:
-            if isinstance(jacoco_cov, dict):
-                cov_path = jacoco_cov.get("path") or ""
-                if jacoco_cov.get("ok") and jacoco_cov.get("line_pct") is not None:
-                    cov_line = f"{jacoco_cov.get('line_pct')}"
-                if jacoco_cov.get("ok") and jacoco_cov.get("branch_pct") is not None:
-                    cov_branch = f"{jacoco_cov.get('branch_pct')}"
-                if not jacoco_cov.get("ok"):
-                    reason = jacoco_cov.get("reason") or "jacoco.xml unavailable"
-                    cov_note = f"Coverage unavailable: {reason}"
-        except Exception:
-            pass
-
         html_text = f"""<!doctype html>
-        <html>
-        <head>
-        <meta charset="utf-8"/>
-        <title>TestWeaver Evaluation Report - {esc(request_id)}</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 24px; }}
-            .card {{ border: 1px solid #ddd; border-radius: 10px; padding: 16px; margin-bottom: 16px; }}
-            table {{ border-collapse: collapse; width: 100%; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }}
-            th {{ background: #f4f4f4; }}
-            .small {{ color: #555; font-size: 13px; }}
-            code {{ background: #f7f7f7; padding: 2px 6px; border-radius: 6px; }}
-        </style>
-        </head>
-        <body>
+    <html>
+    <head>
+    <meta charset="utf-8"/>
+    <title>TestWeaver Evaluation Report</title>
+    <style>
+    :root {{
+    --bg:#0b1220; --panel:#0f1a2b; --panel2:#0c1626;
+    --text:#e7edf7; --muted:#a8b3c7; --line:#22314a;
+    --good:#22c55e; --bad:#ef4444; --warn:#f59e0b;
+    }}
+    body {{
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: linear-gradient(180deg, var(--bg), #070b14 70%);
+    color: var(--text); margin:0;
+    }}
+    .wrap {{ max-width:1100px; margin:auto; padding:28px 18px 60px; }}
+    h1 {{ margin:0 0 6px; font-size:28px; }}
+    .sub {{ color:var(--muted); margin-bottom:18px; }}
+    .grid {{ display:grid; grid-template-columns:1.2fr .8fr; gap:14px; }}
+    .card {{
+    background:linear-gradient(180deg,var(--panel),var(--panel2));
+    border:1px solid var(--line); border-radius:14px;
+    padding:14px; box-shadow:0 10px 30px rgba(0,0,0,.35);
+    }}
+    .badge {{ padding:6px 10px; border-radius:999px; font-size:12px; }}
+    .badge.good {{ background:rgba(34,197,94,.15); }}
+    .badge.bad {{ background:rgba(239,68,68,.15); }}
+    .badge.warn {{ background:rgba(245,158,11,.15); }}
+    .kvs {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }}
+    .kv {{ border:1px dashed rgba(255,255,255,.1); border-radius:12px; padding:10px; }}
+    .k {{ color:var(--muted); font-size:12px; }}
+    .v {{ font-size:13px; }}
+    table {{
+    width:100%; border-collapse:collapse; margin-top:14px;
+    border:1px solid var(--line); border-radius:14px; overflow:hidden;
+    }}
+    th,td {{ padding:10px; font-size:13px; border-bottom:1px solid rgba(255,255,255,.08); }}
+    th {{ color:var(--muted); text-transform:uppercase; font-size:11px; }}
+    tr:nth-child(odd) {{ background:rgba(255,255,255,.02); }}
+    .stage.gen {{ color:#60a5fa; }}
+    .stage.fix {{ color:#a78bfa; }}
+    .stage.compile {{ color:#93c5fd; }}
+    .stage.compile_after_autofix {{ color:#34d399; }}
+    .stage.success {{ color:var(--good); }}
+    .stage.fail {{ color:var(--bad); }}
+    .small {{ color:var(--muted); font-size:12px; }}
+    </style>
+    </head>
 
-        <h1>TestWeaver Evaluation Report</h1>
+    <body>
+    <div class="wrap">
+    <h1>TestWeaver Evaluation Report</h1>
+    <p class="sub">Compilation-aware test generation with RAG, bounded auto-repair, and JaCoCo evaluation</p>
 
-        <div class="card">
-        <p><b>Run ID (request_id):</b> <code>{esc(request_id)}</code></p>
-        <p><b>Session:</b> <code>{esc(session_id)}</code></p>
-        <p><b>Service Path:</b> <code>{esc(service_path)}</code></p>
-        <p><b>Test Path:</b> <code>{esc(test_path)}</code></p>
-        <p><b>Outcome:</b> {outcome_badge}</p>
-        <p><b>Compilation OK:</b> {esc(compile_ok)}</p>
-        <p><b>Attempts Used:</b> {esc(attempts_used)}</p>
-        <p><b>Total Time (seconds):</b> {esc(total_seconds)}</p>
-
-        <p><b>Coverage (JaCoCo):</b> LINE={esc(cov_line)} | BRANCH={esc(cov_branch)}</p>
-        <p class="small">{esc(cov_note)}</p>
-        {f'<p class="small">jacoco.xml: <code>{esc(cov_path)}</code></p>' if cov_path else ''}
+    <div class="grid">
+    <div class="card">
+        <h2>Run Summary</h2>
+        <div class="kvs">
+        <div class="kv"><div class="k">Outcome</div><div class="v">{outcome_badge}</div></div>
+        <div class="kv"><div class="k">Compilation OK</div><div class="v">{esc(compile_ok)}</div></div>
+        <div class="kv"><div class="k">Attempts Used</div><div class="v">{esc(attempts_used)}</div></div>
+        <div class="kv"><div class="k">Total Time (s)</div><div class="v">{esc(total_seconds)}</div></div>
         </div>
+        <p class="small">request_id: <code>{esc(request_id)}</code></p>
+        <p class="small">service: <code>{esc(service_path)}</code></p>
+        <p class="small">test: <code>{esc(test_path)}</code></p>
+    </div>
 
-        {agg_html}
-
-        <div class="card">
-        <h2>Stage Metrics (per attempt)</h2>
-        <table>
-            <thead>
-            <tr>
-                <th>Stage</th>
-                <th>Timestamp (UTC)</th>
-                <th>Attempt</th>
-                <th>Compile OK</th>
-                <th>Returncode</th>
-                <th>Tests</th>
-                <th>Assertions</th>
-                <th>Assertions/Test</th>
-                <th>Leakage</th>
-                <th>RAG Hit</th>
-                <th>RAG chars</th>
-                <th>Diff (+/-/~)</th>
-            </tr>
-            </thead>
-            <tbody>
-            {''.join(rows)}
-            </tbody>
-        </table>
+    <div class="card">
+        <h2>Quality Signals</h2>
+        <div class="kvs">
+        <div class="kv"><div class="k">JaCoCo LINE %</div><div class="v">{cov_line}</div></div>
+        <div class="kv"><div class="k">JaCoCo BRANCH %</div><div class="v">{cov_branch}</div></div>
+        <div class="kv"><div class="k">jacoco.xml</div><div class="v"><code>{cov_path}</code></div></div>
+        <div class="kv"><div class="k">Note</div><div class="v small">{esc(cov_note)}</div></div>
         </div>
+    </div>
+    </div>
 
-        <div class="card">
-        <h2>Compilation Diagnostics (Normalized Signatures)</h2>
-        {''.join(sig_sections) if sig_sections else '<p><i>No compile signature sections found.</i></p>'}
-        </div>
+    <div class="card">
+    <h2>Stage Metrics (per attempt)</h2>
+    <table>
+    <thead>
+    <tr>
+    <th>Stage</th><th>Timestamp</th><th>Attempt</th><th>Compile OK</th><th>RC</th>
+    <th>Tests</th><th>Assertions</th><th>A/Test</th><th>Leak</th><th>RAG</th><th>RAG chars</th>
+    </tr>
+    </thead>
+    <tbody>
+    {''.join(rows)}
+    </tbody>
+    </table>
+    </div>
 
-        </body>
-        </html>
-        """
+    <div class="card">
+    <h2>Compilation Diagnostics</h2>
+    {''.join(sig_sections) if sig_sections else "<p class='small'><i>No compile diagnostics.</i></p>"}
+    </div>
+
+    </div>
+    </body>
+    </html>
+    """
 
         out_dir = pathlib.Path(self._reports_dir())
+        out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"report_{request_id}.html"
         try:
             out_path.write_text(html_text, encoding="utf-8")
+            return str(out_path)
         except Exception:
             return ""
-        return str(out_path)
 
     # ------------------------------------------------------------------
     # Public API
@@ -835,6 +821,7 @@ Rules (MUST FOLLOW):
             }
 
         last_test_code = ""
+        baseline_test_code = ""
         last_compile: Optional[Dict[str, Any]] = None
         attempt_log: List[Dict[str, Any]] = []
 
@@ -861,6 +848,11 @@ Rules (MUST FOLLOW):
             response = self.llm.chat(messages, temperature=self.llm_temperature)
 
             candidate = self._extract_java_class(self._strip_code_fences(response))
+
+            # FREEZE BASELINE BEFORE ANY AUTOFIX
+            if attempt == 1 and not baseline_test_code:
+                baseline_test_code = candidate
+
             if attempt > 1 and prev_test_before_llm:
                 candidate = self._rename_test_methods_to_match_base(candidate, prev_test_before_llm)
 
@@ -893,11 +885,19 @@ Rules (MUST FOLLOW):
             test_code = candidate
             last_test_code = test_code
 
+            if attempt == 1 and not baseline_test_code:
+                baseline_test_code = test_code   # ✅ freeze baseline
+
             self.git.write_file(test_path, test_code, overwrite=True)
 
             # Metrics event: gen/fix
             try:
-                payload = self._build_metrics_payload(test_code, prev_test_before_llm, last_compile, rag_context)
+                payload = self._build_metrics_payload(
+                    test_code,
+                    baseline_test_code if baseline_test_code else prev_test_before_llm,
+                    last_compile,
+                    rag_context,
+                )
                 evt = EvalEvent(
                     request_id=request_id,
                     session_id=self.session_id,
@@ -987,7 +987,12 @@ Rules (MUST FOLLOW):
 
             # Metrics event: compile
             try:
-                compile_payload = self._build_metrics_payload(last_test_code, prev_test_before_llm, last_compile, rag_context)
+                compile_payload = self._build_metrics_payload(
+                    last_test_code,
+                    baseline_test_code if baseline_test_code else prev_test_before_llm,
+                    last_compile,
+                    rag_context
+                )
                 evt = EvalEvent(
                     request_id=request_id,
                     session_id=self.session_id,

@@ -30,3 +30,5 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+testweaver/metrics/agent_metrics.jsonl
+testweaver/metrics/reports/report_a3ce2f0e-7176-475e-863e-726d1164e8b4.html
